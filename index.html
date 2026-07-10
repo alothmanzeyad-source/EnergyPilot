@@ -453,7 +453,7 @@ function seasonTemp(d) {
 }
 function pvIrradiance(d) {
   // 0 = Wintertief, 1 = Sommerhoch; kalibriert auf CH-Jahresertrag ~900-1000 kWh/kWp
-  const seasonal = 0.5 - 0.5 * Math.cos(2 * Math.PI * (d - 172) / 365);
+  const seasonal = 0.5 + 0.5 * Math.cos(2 * Math.PI * (d - 172) / 365);
   return 0.12 + 0.30 * seasonal;
 }
 function isWeekend(d, startWeekday) {
@@ -519,10 +519,112 @@ function ladDay(kw, count, sessionsPerWeek, shapeKey, d, startWeekday) {
   const dailyKwh = kw * count * (sessionsPerWeek / 7) * 2.2 * weekendFactor;
   return SHAPES[shapeKey].map(w => w * dailyKwh);
 }
-function isHT(d, stepInDay, startWeekday) {
+
+// Standard-Preissignal: mindestens 4 Tarife mit eigenen Zeitfenstern —
+// deckt gemeinsam lückenlos alle 24h/7 Tage ab (Reihenfolge = Priorität).
+const DEFAULT_TARIFF_TIERS = [{
+  id: "nt",
+  name: "Niedertarif",
+  price: 14,
+  startHour: 22,
+  endHour: 6,
+  scope: "all",
+  color: "#5B8DBE"
+}, {
+  id: "ht",
+  name: "Hochtarif",
+  price: 24,
+  startHour: 6,
+  endHour: 17,
+  scope: "weekday",
+  color: "#E8A33D"
+}, {
+  id: "peak",
+  name: "Spitzentarif",
+  price: 32,
+  startHour: 17,
+  endHour: 22,
+  scope: "weekday",
+  color: "#D9705A"
+}, {
+  id: "weekend",
+  name: "Wochenendtarif",
+  price: 13,
+  startHour: 6,
+  endHour: 22,
+  scope: "weekend",
+  color: "#4FA88C"
+}];
+const DYNAMIC_TIER_COLORS = ["#5B8DBE", "#E8A33D", "#D9705A", "#4FA88C", "#8B6FD9", "#C9A66B", "#A6704A", "#F2B84B"];
+
+// Erzeugt N gleichmässig über den Tag verteilte Tarifstufen als Startpunkt
+// für den "Dynamischen Tarif" — Preise/Zeiten sind danach per Regler frei anpassbar.
+function generateDynamicTiers(n) {
+  const seg = 24 / n;
+  return Array.from({
+    length: n
+  }, (_, i) => ({
+    id: `dyn${i}`,
+    name: `Tarif ${i + 1}`,
+    price: +(16 + i * (20 / Math.max(1, n - 1))).toFixed(1),
+    startHour: Math.round(i * seg),
+    endHour: Math.round((i + 1) * seg),
+    scope: "all",
+    color: DYNAMIC_TIER_COLORS[i % DYNAMIC_TIER_COLORS.length]
+  }));
+}
+
+// Simuliertes Echtzeit-Signal für Systemdienstleistungen (z.B. Primärregelleistung/
+// FCR, die Swissgrid ausschreibt und EWs/Aggregatoren über kleine Batteriespeicher
+// anbieten können). Da keine reale Swissgrid-Schnittstelle angebunden ist, wird
+// hier ein plausibles, zeitabhängiges Muster simuliert (höhere Vergütung in
+// Lastspitzenzeiten morgens/abends).
+function sdlInstantRates(date) {
+  const hour = date.getHours() + date.getMinutes() / 60;
+  const base = 3.5 + 2.2 * Math.sin((hour - 7) / 24 * Math.PI * 2);
+  const noise = Math.sin(date.getTime() / 180000) * 0.6;
+  const charge = Math.max(0.3, +(base + noise).toFixed(2));
+  const discharge = Math.max(0.3, +(base * 1.35 + noise).toFixed(2));
+  return {
+    charge,
+    discharge
+  };
+}
+
+// Ermittelt den aktiven Tarif für einen Zeitpunkt (Zeitfenster können über
+// Mitternacht laufen, z.B. 22-6 Uhr). scope: "all" | "weekday" | "weekend".
+function getTariffTier(tiers, d, stepInDay, startWeekday) {
   const hour = stepInDay / 4;
-  if (isWeekend(d, startWeekday)) return false;
-  return hour >= 6 && hour < 22;
+  const wknd = isWeekend(d, startWeekday);
+  for (const t of tiers) {
+    if (t.scope === "weekend" && !wknd) continue;
+    if (t.scope === "weekday" && wknd) continue;
+    if (t.startHour > t.endHour) {
+      if (hour >= t.startHour || hour < t.endHour) return t;
+    } else {
+      if (hour >= t.startHour && hour < t.endHour) return t;
+    }
+  }
+  return tiers[0];
+}
+
+// Höchster Tarifpreis innerhalb der nächsten `lookaheadSteps` 15-Min-Slots
+// (für die vorausschauende Batteriesteuerung: erkennt bevorstehende teure
+// Zeitfenster, unabhängig davon wie viele Tarifstufen es gibt).
+function maxPriceWithin(tiers, d, stepInDay, startWeekday, lookaheadSteps, totalDays) {
+  let maxP = -Infinity;
+  for (let k = 1; k <= lookaheadSteps; k++) {
+    let dd = d,
+      ss = stepInDay + k;
+    if (ss >= STEPS_PER_DAY) {
+      dd += 1;
+      ss -= STEPS_PER_DAY;
+    }
+    if (dd >= totalDays) break;
+    const t = getTariffTier(tiers, dd, ss, startWeekday);
+    if (t.price > maxP) maxP = t.price;
+  }
+  return maxP === -Infinity ? 0 : maxP;
 }
 
 // ---------------------------------------------------------------------------
@@ -534,9 +636,12 @@ function runSimulation(cfg) {
     scale,
     levers,
     tariff,
+    tariffTiers,
     csvBase,
-    startWeekday
+    startWeekday,
+    forecastFactor
   } = cfg;
+  const tiers = tariffTiers && tariffTiers.length > 0 ? tariffTiers : DEFAULT_TARIFF_TIERS;
   const bt = BUILDING_TYPES[type];
   const annualKwh = bt.kwhPerUnit * scale;
   const days = csvBase ? Math.floor(csvBase.length / STEPS_PER_DAY) : DAYS;
@@ -566,10 +671,10 @@ function runSimulation(cfg) {
   let sumOnsite = 0,
     sumExport = 0,
     sumGrid = 0,
-    sumHT = 0,
-    sumNT = 0;
+    energyCostAccum = 0;
   let sumBatteryCharge = 0,
-    sumBatteryDischarge = 0;
+    sumBatteryDischarge = 0,
+    sumBatteryGridCharge = 0;
   const durationCurve = [];
   const heatSum = Array.from({
     length: 7
@@ -580,6 +685,16 @@ function runSimulation(cfg) {
   const heatMax = Array.from({
     length: 7
   }, () => new Array(STEPS_PER_DAY).fill(0));
+  // Aufschlüsselung nach Tarifstufe (für die "Preissignal"-Auswertung)
+  const tierStats = {};
+  tiers.forEach(t => {
+    tierStats[t.id] = {
+      name: t.name,
+      color: t.color,
+      kwh: 0,
+      cost: 0
+    };
+  });
 
   // Batteriespeicher: Ladezustand (SoC) bleibt über das ganze Jahr erhalten
   // (kein Reset pro Tag) — ein echter Speicher lädt/entlädt kontinuierlich.
@@ -589,6 +704,18 @@ function runSimulation(cfg) {
   const rtEff = battOn ? Math.max(0.5, Math.min(1, levers.batteryEfficiency / 100)) : 1;
   const oneWayEff = Math.sqrt(rtEff); // Round-Trip-Wirkungsgrad symmetrisch auf Lade-/Entladepfad verteilt
   let soc = capacityKwh * 0.5; // Start bei 50% SoC
+
+  // Vorausschauende Steuerung (Tarif-Lookahead + EW-Signal + Wetterprognose-Bias)
+  const predictive = battOn && levers.batteryStrategy === "predictive";
+  const ewSignal = levers.ewSignal || "gruen"; // "gruen" | "gelb" | "rot"
+  // forecastFactor: 1 = normaler Prognose-Ertrag, <1 = unterdurchschnittlich (mehr
+  // Reserve halten), >1 = überdurchschnittlich (mehr auf PV verlassen). Kommt aus
+  // der geladenen Wetterprognose (Open-Meteo); ohne Prognose = 1 (neutral).
+  const ff = typeof forecastFactor === "number" && isFinite(forecastFactor) ? forecastFactor : 1;
+  const targetFraction = Math.max(0.5, Math.min(0.95, 0.9 - (ff - 1) * 0.3));
+  const gridChargeAllowed = ewSignal !== "rot";
+  const gridChargePowerFactor = ewSignal === "gelb" ? 0.5 : 1; // gelb = gedrosselt, rot = gesperrt
+  const lookaheadSteps = 16; // 4 Stunden
 
   for (let d = 0; d < days; d++) {
     const base = csvBase ? csvBase.slice(d * STEPS_PER_DAY, (d + 1) * STEPS_PER_DAY) : baseDay(type, annualKwh, d, startWeekday);
@@ -601,6 +728,18 @@ function runSimulation(cfg) {
     const lad = levers.lad ? ladDay(levers.ladKw, levers.ladCount, levers.ladSessionsPerWeek, ladShape, d, startWeekday) : new Array(STEPS_PER_DAY).fill(0);
     const month = Math.floor(d / days * 12);
     const wd = (d + startWeekday) % 7;
+
+    // Erwartete PV-Deckung für HEUTE: nur vorausschauend aus dem Netz laden,
+    // wenn PV den Tagesbedarf voraussichtlich NICHT von selbst deckt — sonst
+    // würde das Vorladen späteren, kostenlosen PV-Überschuss verdrängen
+    // (Exportverlust statt Ersparnis).
+    let needsGridReserve = true;
+    if (predictive) {
+      const dayDemandTotal = base.reduce((a, b) => a + b, 0) + wp.reduce((a, b) => a + b, 0) + boiler.reduce((a, b) => a + b, 0) + elektro.reduce((a, b) => a + b, 0) + lad.reduce((a, b) => a + b, 0);
+      const dayPvTotal = pv.reduce((a, b) => a + b, 0);
+      const pvCoverageRatio = dayDemandTotal > 0 ? dayPvTotal / dayDemandTotal : 1;
+      needsGridReserve = pvCoverageRatio < 0.85 * ff;
+    }
     for (let s = 0; s < STEPS_PER_DAY; s++) {
       const demand = base[s] + wp[s] + boiler[s] + elektro[s] + lad[s];
       const onsitePv = Math.min(pv[s], demand);
@@ -608,7 +747,8 @@ function runSimulation(cfg) {
       let deficit = demand - onsitePv; // Restbedarf nach direktem PV-Verbrauch
       const gridKwNoBatt = deficit * 4;
       let batteryDischarge = 0,
-        batteryCharge = 0;
+        batteryCharge = 0,
+        batteryGridCharge = 0;
       if (battOn && capacityKwh > 0) {
         // Überschuss zuerst in die Batterie laden (Eigenverbrauchsoptimierung)
         if (surplus > 0) {
@@ -618,6 +758,22 @@ function runSimulation(cfg) {
           soc += batteryCharge * oneWayEff;
           surplus -= batteryCharge;
         }
+
+        // VORAUSSCHAUEND: Falls in den nächsten Stunden ein teureres Tarif-
+        // fenster beginnt und der Preisunterschied das lohnt, gezielt aus dem
+        // günstigeren aktuellen Tarif vorladen — gedrosselt/gesperrt je nach EW-Signal.
+        if (predictive && gridChargeAllowed && needsGridReserve) {
+          const currentTier = getTariffTier(tiers, d, s, startWeekday);
+          const futureMax = maxPriceWithin(tiers, d, s, startWeekday, lookaheadSteps, days);
+          const targetSoc = capacityKwh * targetFraction;
+          if (futureMax > currentTier.price * 1.15 && soc < targetSoc) {
+            const remainingPower = Math.max(0, powerKw * 0.25 * gridChargePowerFactor - batteryCharge);
+            const headroom = (targetSoc - soc) / oneWayEff;
+            batteryGridCharge = Math.min(remainingPower, Math.max(0, headroom));
+            soc += batteryGridCharge * oneWayEff;
+          }
+        }
+
         // Restbedarf aus der Batterie decken, falls noch Energie vorhanden
         if (deficit > 0 && soc > 0) {
           const maxDischargePower = powerKw * 0.25;
@@ -627,6 +783,8 @@ function runSimulation(cfg) {
           deficit -= batteryDischarge;
         }
       }
+      deficit += batteryGridCharge; // gezielte Netzladung zählt als zusätzlicher (gewollter) Netzbezug
+
       const onsite = onsitePv + batteryDischarge;
       const exp = surplus;
       const grid = deficit;
@@ -640,16 +798,21 @@ function runSimulation(cfg) {
       sumOnsite += onsite;
       sumExport += exp;
       sumGrid += grid;
-      sumBatteryCharge += batteryCharge;
+      sumBatteryCharge += batteryCharge + batteryGridCharge;
       sumBatteryDischarge += batteryDischarge;
+      sumBatteryGridCharge += batteryGridCharge;
       peakGrid = Math.max(peakGrid, gridKw);
       peakGridNoBatt = Math.max(peakGridNoBatt, gridKwNoBatt);
       durationCurve.push(gridKw);
       heatSum[wd][s] += gridKw;
       heatCount[wd][s] += 1;
       if (gridKw > heatMax[wd][s]) heatMax[wd][s] = gridKw;
-      const ht = isHT(d, s, startWeekday);
-      if (ht) sumHT += grid;else sumNT += grid;
+      const tier = getTariffTier(tiers, d, s, startWeekday);
+      const price = tier.price;
+      const intervalCost = grid * price / 100;
+      energyCostAccum += intervalCost;
+      tierStats[tier.id].kwh += grid;
+      tierStats[tier.id].cost += intervalCost;
       monthly[month].base += base[s];
       monthly[month].pv += pv[s];
       monthly[month].wp += wp[s];
@@ -659,12 +822,11 @@ function runSimulation(cfg) {
       monthly[month].grid += grid;
       monthly[month].exportKwh += exp;
       monthly[month].batteryDischarge += batteryDischarge;
-      const price = ht ? tariff.htPrice : tariff.ntPrice;
-      monthly[month].costEnergy += grid * price / 100;
+      monthly[month].costEnergy += intervalCost;
       monthly[month].costNetz += grid * tariff.netzentgelt / 100;
     }
   }
-  const energyCost = (sumHT * tariff.htPrice + sumNT * tariff.ntPrice) / 100;
+  const energyCost = energyCostAccum;
   const netzCost = sumGrid * tariff.netzentgelt / 100;
   const leistungsCost = tariff.leistungActive ? peakGrid * tariff.leistungspreis : 0;
   const einspeiseErtrag = sumExport * tariff.einspeise / 100;
@@ -700,9 +862,11 @@ function runSimulation(cfg) {
     autarkiegrad: annualKwhTotal > 0 ? sumOnsite / annualKwhTotal * 100 : 0,
     sumBatteryCharge,
     sumBatteryDischarge,
+    sumBatteryGridCharge,
     batteryCycles,
     capacityKwh,
     powerKw,
+    tierStats,
     monthly,
     durationSampled,
     heatMax,
@@ -711,6 +875,154 @@ function runSimulation(cfg) {
   };
 }
 const MONTH_LABELS = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"];
+
+// Vordefinierte Test-Szenarien: setzen Tagesvorschau + PV-Faktor für die
+// Tagesprofil-Grafik — für Kundengespräche/Demonstrationen ("Trigger").
+const SCENARIOS = [{
+  key: "sommer_ueberschuss",
+  icon: "☀️",
+  label: "Sommer: PV-Überschuss",
+  description: "Viel Sonne, PV-Überschuss lädt den Speicher — zusätzlich vorausschauend zum günstigsten Preis laut Preissignal EW.",
+  dayIdx: 200,
+  pvFactor: 1.3,
+  tariffMultiplier: 1,
+  leverOverrides: {
+    pv: true,
+    battery: true,
+    batteryStrategy: "predictive"
+  }
+}, {
+  key: "winter_wp",
+  icon: "❄️",
+  label: "Winter: Wärmepumpen-Betrieb",
+  description: "Wenig Sonne, Wärmepumpe läuft viel — der Speicher lädt trotzdem vorausschauend in günstigen Zeitfenstern.",
+  dayIdx: 15,
+  pvFactor: 0.5,
+  tariffMultiplier: 1,
+  leverOverrides: {
+    wp: true,
+    battery: true,
+    batteryStrategy: "predictive"
+  }
+}, {
+  key: "preisspitze_entladen",
+  icon: "💰",
+  label: "Teure Stunden: Speicher entlädt",
+  description: "Bei steigenden Preisen entlädt der Speicher gezielt, um teuren Netzbezug zu vermeiden.",
+  dayIdx: 200,
+  pvFactor: 1,
+  tariffMultiplier: 1.5,
+  leverOverrides: {
+    battery: true,
+    batteryStrategy: "predictive"
+  }
+}, {
+  key: "dunkelflaute",
+  icon: "🌫️",
+  label: "Dunkelflaute",
+  description: "Mehrtägig kaum Sonne — der Speicher dient primär als Reserve statt als PV-Puffer.",
+  dayIdx: 15,
+  pvFactor: 0.12,
+  tariffMultiplier: 1,
+  leverOverrides: {
+    pv: true,
+    battery: true,
+    batteryStrategy: "predictive"
+  }
+}, {
+  key: "alltag_eigenverbrauch",
+  icon: "🏠",
+  label: "Alltag: Eigenverbrauch",
+  description: "Normaler Tag ohne besonderes Preissignal — Speicher optimiert rein auf PV-Eigenverbrauch.",
+  dayIdx: 100,
+  pvFactor: 1,
+  tariffMultiplier: 1,
+  leverOverrides: {
+    pv: true,
+    battery: true,
+    batteryStrategy: "reactive"
+  }
+}];
+
+// Vordefinierte Standorte für die Wetterprognose (frei per Koordinaten erweiterbar)
+const WEATHER_LOCATIONS = [{
+  name: "Rüti (ZH)",
+  lat: 47.259,
+  lon: 8.858
+}, {
+  name: "Zürich",
+  lat: 47.3769,
+  lon: 8.5417
+}, {
+  name: "Bern",
+  lat: 46.948,
+  lon: 7.4474
+}, {
+  name: "St. Gallen",
+  lat: 47.4245,
+  lon: 9.3767
+}];
+
+// Wandelt Open-Meteo-Stundenwerte (Globalstrahlung W/m²) in eine grobe
+// Tagesprognose um: erwarteter PV-Ertrag [kWh je kWp] + Verhältnis zum
+// saisonal üblichen Modellwert (= "Prognose-Faktor" für die Batteriesteuerung).
+function weatherIcon(cloudCover) {
+  if (cloudCover < 20) return "☀️";
+  if (cloudCover < 50) return "🌤️";
+  if (cloudCover < 80) return "⛅";
+  return "☁️";
+}
+function processWeatherForecast(json, currentDayOfYear) {
+  const times = json.hourly.time;
+  const radiation = json.hourly.shortwave_radiation;
+  const cloudCover = json.hourly.cloud_cover || [];
+  const temperature = json.hourly.temperature_2m || [];
+  const byDay = {};
+  for (let i = 0; i < times.length; i++) {
+    const dateKey = times[i].slice(0, 10);
+    if (!byDay[dateKey]) byDay[dateKey] = {
+      rad: [],
+      cloud: [],
+      temp: []
+    };
+    byDay[dateKey].rad.push(radiation[i] || 0);
+    byDay[dateKey].cloud.push(cloudCover[i] != null ? cloudCover[i] : 50);
+    byDay[dateKey].temp.push(temperature[i] != null ? temperature[i] : null);
+  }
+  const dateKeys = Object.keys(byDay).sort();
+  const performanceRatio = 0.85; // System-/Temperaturverluste, typische Annahme
+  const days = dateKeys.slice(0, 7).map(key => {
+    const b = byDay[key];
+    const kwhPerKwp = b.rad.reduce((sum, w) => sum + w / 1000 * performanceRatio, 0);
+    const avgCloud = b.cloud.reduce((a, v) => a + v, 0) / b.cloud.length;
+    const temps = b.temp.filter(t => t !== null);
+    const minTemp = temps.length ? Math.min(...temps) : null;
+    const maxTemp = temps.length ? Math.max(...temps) : null;
+    return {
+      date: key,
+      kwhPerKwp: +kwhPerKwp.toFixed(2),
+      cloudCover: Math.round(avgCloud),
+      minTemp: minTemp !== null ? Math.round(minTemp) : null,
+      maxTemp: maxTemp !== null ? Math.round(maxTemp) : null,
+      icon: weatherIcon(avgCloud)
+    };
+  });
+  // Vergleich zum saisonal erwarteten Modellwert (unsere eigene pvIrradiance-Kurve)
+  const modelExpected = days.map((_, idx) => {
+    const seasonal = 0.5 + 0.5 * Math.cos(2 * Math.PI * (currentDayOfYear + idx - 172) / 365);
+    const irr = 0.12 + 0.30 * seasonal;
+    return irr * 8.91; // gleiche Integrationskonstante wie pvDay()
+  });
+  const avgForecast = days.reduce((a, b) => a + b.kwhPerKwp, 0) / days.length;
+  const avgModel = modelExpected.reduce((a, b) => a + b, 0) / modelExpected.length;
+  const factor = avgModel > 0 ? avgForecast / avgModel : 1;
+  return {
+    days,
+    factor: Math.max(0.3, Math.min(2, factor)),
+    avgForecast: +avgForecast.toFixed(2),
+    avgModel: +avgModel.toFixed(2)
+  };
+}
 const WEEKDAY_LABELS = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"];
 const fmt0 = v => Math.round(v).toLocaleString("de-CH");
 const fmt1 = v => v.toLocaleString("de-CH", {
@@ -1285,10 +1597,13 @@ function PaybackChart({
     fill: "#8A938E"
   }, "CHF"));
 }
-function SoCSparkline({
+function MiniSparkline({
   data,
+  field,
+  color = "#F2B84B",
   width = 640,
-  height = 60
+  height = 60,
+  fixedMax = null
 }) {
   const margin = {
     top: 6,
@@ -1299,9 +1614,10 @@ function SoCSparkline({
   const w = width - margin.left - margin.right;
   const h = height - margin.top - margin.bottom;
   const n = data.length;
+  const maxV = fixedMax !== null ? fixedMax : Math.max(1, ...data.map(d => d[field]));
   const x = i => margin.left + i / (n - 1) * w;
-  const y = v => margin.top + h - v / 100 * h;
-  const points = data.map((d, i) => `${x(i)},${y(d.BatterieSoC)}`).join(" L ");
+  const y = v => margin.top + h - v / maxV * h;
+  const points = data.map((d, i) => `${x(i)},${y(d[field])}`).join(" L ");
   const areaPath = `M ${x(0)},${y(0)} L ${points} L ${x(n - 1)},${y(0)} Z`;
   return /*#__PURE__*/React.createElement("svg", {
     width: "100%",
@@ -1311,13 +1627,125 @@ function SoCSparkline({
     }
   }, /*#__PURE__*/React.createElement("path", {
     d: areaPath,
-    fill: "#F2B84B",
+    fill: color,
     fillOpacity: "0.18"
   }), /*#__PURE__*/React.createElement("polyline", {
     points: points,
     fill: "none",
-    stroke: "#F2B84B",
+    stroke: color,
     strokeWidth: "2"
+  }));
+}
+
+// Visualisiert ein Tarifschema als farbige 24h-Leiste (separat für Werktag/
+// Wochenende) — macht die Zeitfenster auf einen Blick verständlich.
+function TariffScheduleStrip({
+  tiers,
+  weekend = false
+}) {
+  const segments = [];
+  for (let h = 0; h < 24; h++) {
+    const tier = tiers.find(t => {
+      if (t.scope === "weekend" && !weekend) return false;
+      if (t.scope === "weekday" && weekend) return false;
+      return t.startHour > t.endHour ? h >= t.startHour || h < t.endHour : h >= t.startHour && h < t.endHour;
+    }) || tiers[0];
+    segments.push(tier);
+  }
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      height: 14,
+      borderRadius: 4,
+      overflow: "hidden"
+    }
+  }, segments.map((t, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      flex: 1,
+      backgroundColor: t.color
+    },
+    title: `${i}:00 ${t.name}`
+  }))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      fontSize: 8,
+      color: "#5A6360",
+      marginTop: 2
+    }
+  }, /*#__PURE__*/React.createElement("span", null, "0h"), /*#__PURE__*/React.createElement("span", null, "6h"), /*#__PURE__*/React.createElement("span", null, "12h"), /*#__PURE__*/React.createElement("span", null, "18h"), /*#__PURE__*/React.createElement("span", null, "24h")));
+}
+function WeatherDayCards({
+  data
+}) {
+  const WD = ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"];
+  const maxKwh = Math.max(1, ...data.map(d => d.kwhPerKwp));
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: `repeat(${data.length}, 1fr)`,
+      gap: 6
+    }
+  }, data.map((d, i) => {
+    const wd = WD[new Date(d.date).getDay()];
+    const barPct = Math.max(4, d.kwhPerKwp / maxKwh * 100);
+    return /*#__PURE__*/React.createElement("div", {
+      key: i,
+      style: {
+        borderRadius: 10,
+        padding: "8px 4px",
+        textAlign: "center",
+        backgroundColor: i === 0 ? "#20302A" : "#181D1F",
+        border: `1px solid ${i === 0 ? "#4FA88C" : "#2E3634"}`
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "stc-mono",
+      style: {
+        fontSize: 9,
+        color: i === 0 ? "#4FA88C" : "#8A938E",
+        fontWeight: 600
+      }
+    }, i === 0 ? "HEUTE" : wd), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 20,
+        margin: "4px 0"
+      }
+    }, d.icon), /*#__PURE__*/React.createElement("div", {
+      style: {
+        height: 30,
+        display: "flex",
+        alignItems: "flex-end",
+        justifyContent: "center",
+        marginBottom: 3
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        width: 10,
+        height: `${barPct}%`,
+        backgroundColor: "#F2B84B",
+        borderRadius: 3,
+        minHeight: 3
+      }
+    })), /*#__PURE__*/React.createElement("div", {
+      className: "stc-display",
+      style: {
+        fontSize: 11,
+        fontWeight: 600,
+        color: "#F2B84B"
+      }
+    }, d.kwhPerKwp), /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 8,
+        color: "#5A6360"
+      }
+    }, "kWh/kWp"), d.maxTemp !== null && /*#__PURE__*/React.createElement("div", {
+      style: {
+        fontSize: 9,
+        color: "#8A938E",
+        marginTop: 3
+      }
+    }, d.maxTemp, "° / ", d.minTemp, "°"));
   }));
 }
 function LoadHeatmap({
@@ -1598,6 +2026,13 @@ function StromtarifCockpit() {
     batteryCount: 1,
     batteryEfficiency: 90,
     batteryCostPerKwh: 650,
+    batteryStrategy: "predictive",
+    // "reactive" | "predictive"
+    ewSignal: "gruen",
+    // "gruen" | "gelb" | "rot" — simuliertes Netzsignal vom EW
+    sdlEnabled: false,
+    sdlPricePerKw: 100,
+    // Systemdienstleistungen (Swissgrid via EW)
     wp: false,
     wpKwTh: 8,
     wpCount: 1,
@@ -1614,17 +2049,72 @@ function StromtarifCockpit() {
     ladSessionsPerWeek: 4
   });
   const [tariff, setTariff] = useState({
-    htPrice: 22,
-    ntPrice: 15,
     netzentgelt: 9,
     einspeise: 8,
     leistungActive: false,
     leistungspreis: 90
   });
+  const [tariffTiers, setTariffTiers] = useState(DEFAULT_TARIFF_TIERS.map(t => ({
+    ...t
+  })));
+  const [tariffMode, setTariffMode] = useState("zeittarif"); // "zeittarif" | "einheitstarif" | "dynamisch"
+  const [flatPrice, setFlatPrice] = useState(20);
+  const [dynamicCount, setDynamicCount] = useState(3);
+  const [dynamicTiers, setDynamicTiers] = useState(generateDynamicTiers(3));
   const [dayIdx, setDayIdx] = useState(200);
+  const [activeScenario, setActiveScenario] = useState(null);
+  const [scenarioPvFactor, setScenarioPvFactor] = useState(1);
+  const [scenarioTariffMultiplier, setScenarioTariffMultiplier] = useState(1);
+  const [weatherLoc, setWeatherLoc] = useState({
+    lat: 47.259,
+    lon: 8.858
+  });
+  const [weatherForecast, setWeatherForecast] = useState(null);
+  const [weatherLoading, setWeatherLoading] = useState(false);
+  const [weatherError, setWeatherError] = useState(null);
   const [heatMode, setHeatMode] = useState("max");
   const [uploadError, setUploadError] = useState(null);
   const bt = BUILDING_TYPES[type];
+  function updateTier(index, patch) {
+    setTariffTiers(prev => prev.map((t, i) => i === index ? {
+      ...t,
+      ...patch
+    } : t));
+  }
+  function applyScenario(sc) {
+    setActiveScenario(sc.key);
+    setDayIdx(sc.dayIdx);
+    setScenarioPvFactor(sc.pvFactor);
+    setScenarioTariffMultiplier(sc.tariffMultiplier || 1);
+    if (sc.leverOverrides) {
+      setLevers(p => ({
+        ...p,
+        ...sc.leverOverrides
+      }));
+    }
+  }
+  function resetScenario() {
+    setActiveScenario(null);
+    setScenarioPvFactor(1);
+    setScenarioTariffMultiplier(1);
+  }
+  async function loadWeatherForecast() {
+    setWeatherLoading(true);
+    setWeatherError(null);
+    try {
+      const url = `https://api.open-meteo.com/v1/forecast?latitude=${weatherLoc.lat}&longitude=${weatherLoc.lon}&hourly=shortwave_radiation,cloud_cover,temperature_2m&forecast_days=7&timezone=auto`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Wetterdienst antwortete mit HTTP ${res.status}`);
+      const json = await res.json();
+      const todayDayOfYear = Math.floor((Date.now() - new Date(new Date().getFullYear(), 0, 0)) / 86400000);
+      const processed = processWeatherForecast(json, todayDayOfYear);
+      setWeatherForecast(processed);
+    } catch (err) {
+      setWeatherError("Prognose konnte nicht geladen werden (" + err.message + "). Prüfe die Internetverbindung.");
+    } finally {
+      setWeatherLoading(false);
+    }
+  }
   function handleTypeChange(t) {
     setType(t);
     setScale(BUILDING_TYPES[t].defaultScale);
@@ -1713,20 +2203,45 @@ function StromtarifCockpit() {
     if (!activeDataset) return null;
     return activeDataset.unit === "kW" ? activeDataset.values.map(v => v * 0.25) : activeDataset.values;
   }, [activeDataset]);
+  const effectiveForecastFactor = activeScenario ? scenarioPvFactor : weatherForecast ? weatherForecast.factor : 1;
+  const sdlNow = sdlInstantRates(new Date());
+  const activeTariffTiers = useMemo(() => {
+    if (tariffMode === "einheitstarif") {
+      return [{
+        id: "flat",
+        name: "Einheitstarif",
+        price: flatPrice,
+        startHour: 0,
+        endHour: 24,
+        scope: "all",
+        color: "#8A938E"
+      }];
+    }
+    if (tariffMode === "dynamisch") {
+      return dynamicTiers;
+    }
+    return tariffTiers;
+  }, [tariffMode, flatPrice, dynamicTiers, tariffTiers]);
+  const effectiveTariffTiers = useMemo(() => scenarioTariffMultiplier !== 1 ? activeTariffTiers.map(t => ({
+    ...t,
+    price: t.price * scenarioTariffMultiplier
+  })) : activeTariffTiers, [activeTariffTiers, scenarioTariffMultiplier]);
   const sim = useMemo(() => runSimulation({
     type,
     scale,
     levers,
     tariff,
+    tariffTiers: effectiveTariffTiers,
     csvBase: csvBaseKwh,
-    startWeekday: 1
-  }), [type, scale, levers, tariff, csvBaseKwh]);
+    startWeekday: 1,
+    forecastFactor: effectiveForecastFactor
+  }), [type, scale, levers, tariff, effectiveTariffTiers, csvBaseKwh, effectiveForecastFactor]);
   const dayData = useMemo(() => {
     const d = dayIdx;
     const dayCountCsv = csvBaseKwh ? Math.max(1, Math.floor(csvBaseKwh.length / STEPS_PER_DAY)) : DAYS;
     const base = csvBaseKwh ? csvBaseKwh.slice(d % dayCountCsv * STEPS_PER_DAY, (d % dayCountCsv + 1) * STEPS_PER_DAY) : baseDay(type, bt.kwhPerUnit * scale, d, 1);
     const pvKwp = levers.pv ? levers.pvKwp * levers.pvCount : 0;
-    const pv = pvDay(pvKwp, d);
+    const pv = pvDay(pvKwp, d).map(v => v * scenarioPvFactor);
     const wp = levers.wp ? wpDay(levers.wpKwTh * levers.wpCount, levers.cop, d) : new Array(STEPS_PER_DAY).fill(0);
     const boiler = levers.boiler ? boilerDay(levers.boilerKw * levers.boilerCount, d) : new Array(STEPS_PER_DAY).fill(0);
     const elektro = levers.elektro ? elektroheizungDay(levers.elektroKw * levers.elektroCount, d) : new Array(STEPS_PER_DAY).fill(0);
@@ -1772,7 +2287,19 @@ function StromtarifCockpit() {
         BatterieSoC: +batteryLevel.toFixed(1)
       };
     });
-  }, [dayIdx, type, scale, levers, csvBaseKwh, bt]);
+  }, [dayIdx, type, scale, levers, csvBaseKwh, bt, scenarioPvFactor]);
+
+  // Zusätzliche Live-Cockpit-Werte: Sonneneinstrahlung (Modellschätzung für den
+  // Vorschautag) und Preisverlauf über den Tag (aus dem aktiven Preissignal).
+  const previewIrradiance = pvIrradiance(dayIdx) * 8.91 * scenarioPvFactor;
+  const dayPriceData = useMemo(() => {
+    return Array.from({
+      length: STEPS_PER_DAY
+    }, (_, i) => ({
+      price: getTariffTier(effectiveTariffTiers, dayIdx, i, 1).price
+    }));
+  }, [dayIdx, effectiveTariffTiers]);
+  const priceNow = getTariffTier(effectiveTariffTiers, dayIdx, 48, 1);
   const monthlyChart = sim.monthly.map((m, i) => ({
     monat: MONTH_LABELS[i],
     Energiekosten: +m.costEnergy.toFixed(0),
@@ -1821,20 +2348,24 @@ function StromtarifCockpit() {
       scale,
       levers: refLevers,
       tariff,
+      tariffTiers: effectiveTariffTiers,
       csvBase: csvBaseKwh,
-      startWeekday: 1
+      startWeekday: 1,
+      forecastFactor: effectiveForecastFactor
     });
     const investition = levers.batteryKwh * levers.batteryCount * levers.batteryCostPerKwh;
-    const jaehrlicheEinsparung = refSim.totalCost - sim.totalCost;
+    const sdlRevenue = levers.sdlEnabled ? levers.batteryKw * levers.batteryCount * levers.sdlPricePerKw : 0;
+    const jaehrlicheEinsparung = refSim.totalCost - sim.totalCost + sdlRevenue;
     const amortisationJahre = jaehrlicheEinsparung > 0 ? investition / jaehrlicheEinsparung : null;
     return {
       investition,
       jaehrlicheEinsparung,
       amortisationJahre,
       kostenOhneBatterie: refSim.totalCost,
-      kostenMitBatterie: sim.totalCost
+      kostenMitBatterie: sim.totalCost,
+      sdlRevenue
     };
-  }, [levers, tariff, csvBaseKwh, type, scale, sim.totalCost]);
+  }, [levers, tariff, effectiveTariffTiers, csvBaseKwh, type, scale, sim.totalCost, effectiveForecastFactor]);
   return /*#__PURE__*/React.createElement("div", {
     style: {
       background: "radial-gradient(circle at 15% 0%, #1B211F 0%, #14181A 55%)",
@@ -1895,6 +2426,188 @@ function StromtarifCockpit() {
       paddingTop: 4
     }
   }, OWNER_NAME)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderRadius: 14,
+      padding: 18,
+      marginBottom: 24,
+      backgroundColor: "#1A2420",
+      border: "1px solid #2E4A3E",
+      boxShadow: "0 4px 24px rgba(0,0,0,0.3)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      flexWrap: "wrap",
+      gap: 8,
+      marginBottom: 4
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 12,
+      textTransform: "uppercase",
+      color: "#4FA88C",
+      fontWeight: 600
+    }
+  }, "⚡ Live-Cockpit"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#8A938E"
+    }
+  }, activeScenario ? `Szenario: ${SCENARIOS.find(s => s.key === activeScenario)?.icon} ${SCENARIOS.find(s => s.key === activeScenario)?.label}` : `Vorschautag ${dayIdx} / 365`)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginBottom: 14
+    }
+  }, "Sonneneinstrahlung, Preissignal und Lastgang reagieren live auf jede Änderung links."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))",
+      gap: 10,
+      marginBottom: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "☀️ Sonneneinstrahlung"), /*#__PURE__*/React.createElement("div", {
+    className: "stc-display",
+    style: {
+      fontSize: 18,
+      fontWeight: 600,
+      color: "#F2B84B"
+    }
+  }, fmt1(previewIrradiance), " ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: "#8A938E"
+    }
+  }, "kWh/kWp"))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "💶 Preis um 12:00"), /*#__PURE__*/React.createElement("div", {
+    className: "stc-display",
+    style: {
+      fontSize: 18,
+      fontWeight: 600,
+      color: priceNow.color
+    }
+  }, fmt1(priceNow.price), " ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: "#8A938E"
+    }
+  }, "Rp/kWh"))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "📉 Netzbezug-Spitze"), /*#__PURE__*/React.createElement("div", {
+    className: "stc-display",
+    style: {
+      fontSize: 18,
+      fontWeight: 600,
+      color: "#E8A33D"
+    }
+  }, fmt1(Math.max(0, ...dayData.map(d => d.Netzbezug)) * 4), " ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: "#8A938E"
+    }
+  }, "kW"))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "🔆 PV-Ertrag heute"), /*#__PURE__*/React.createElement("div", {
+    className: "stc-display",
+    style: {
+      fontSize: 18,
+      fontWeight: 600,
+      color: "#4FA88C"
+    }
+  }, fmt1(dayData.reduce((a, d) => a - d.PV, 0)), " ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: "#8A938E"
+    }
+  }, "kWh"))), levers.battery && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "🔋 Batterie-SoC"), /*#__PURE__*/React.createElement("div", {
+    className: "stc-display",
+    style: {
+      fontSize: 18,
+      fontWeight: 600,
+      color: "#F2B84B"
+    }
+  }, fmt0(Math.min(...dayData.map(d => d.BatterieSoC))), "–", fmt0(Math.max(...dayData.map(d => d.BatterieSoC))), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: "#8A938E"
+    }
+  }, "%"))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "Aktive Trigger"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 14,
+      marginTop: 4
+    }
+  }, levers.ewSignal === "gruen" ? "🟢" : levers.ewSignal === "gelb" ? "🟡" : "🔴", " ", activeScenario ? SCENARIOS.find(s => s.key === activeScenario)?.icon : "—", " ", weatherForecast ? "🌤️" : "", " ", levers.sdlEnabled ? "🔌" : ""))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "grid",
+      gridTemplateColumns: levers.battery ? "1fr 1fr 1fr" : "1fr 1fr",
+      gap: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#8A938E",
+      marginBottom: 3
+    }
+  }, "📉 Lastgang (Netzbezug, heute)"), /*#__PURE__*/React.createElement(MiniSparkline, {
+    data: dayData,
+    field: "Netzbezug",
+    color: "#E8A33D"
+  })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#8A938E",
+      marginBottom: 3
+    }
+  }, "💶 Preisverlauf (heute)"), /*#__PURE__*/React.createElement(MiniSparkline, {
+    data: dayPriceData,
+    field: "price",
+    color: "#8B6FD9"
+  })), levers.battery && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#8A938E",
+      marginBottom: 3
+    }
+  }, "🔋 Batterie-Ladezustand (heute)"), /*#__PURE__*/React.createElement(MiniSparkline, {
+    data: dayData,
+    field: "BatterieSoC",
+    color: "#F2B84B",
+    fixedMax: 100
+  })))), /*#__PURE__*/React.createElement("div", {
     className: "wattfox-grid"
   }, /*#__PURE__*/React.createElement("div", {
     className: "wattfox-panel"
@@ -1902,7 +2615,70 @@ function StromtarifCockpit() {
     style: {
       borderRadius: 14,
       padding: 16,
-      marginBottom: 16,
+      marginTop: 16,
+      backgroundColor: "#241D14",
+      border: "1px solid #4A3A1F",
+      boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 11,
+      textTransform: "uppercase",
+      color: "#E8A33D",
+      marginBottom: 4
+    }
+  }, "🎬 Szenarien — Schnellstart"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#8A938E",
+      marginBottom: 10
+    }
+  }, "Ein Klick stellt Wetter, Tarif ", /*#__PURE__*/React.createElement("strong", null, "und"), " passende Hebel (PV, Wärmepumpe, Speicher) realistisch ein — ideal für Kundengespräche."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexDirection: "column",
+      gap: 8
+    }
+  }, SCENARIOS.map(sc => /*#__PURE__*/React.createElement("button", {
+    key: sc.key,
+    onClick: () => applyScenario(sc),
+    style: {
+      fontSize: 12,
+      padding: "10px 12px",
+      borderRadius: 10,
+      textAlign: "left",
+      border: `1px solid ${activeScenario === sc.key ? "#E8A33D" : "#3A2E1A"}`,
+      color: activeScenario === sc.key ? "#EDEDE9" : "#C9BBA0",
+      backgroundColor: activeScenario === sc.key ? "#2E2113" : "#1D1710"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 600
+    }
+  }, sc.icon, " ", sc.label), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#8A938E",
+      marginTop: 2,
+      fontWeight: 400
+    }
+  }, sc.description)))), activeScenario && /*#__PURE__*/React.createElement("button", {
+    onClick: () => resetScenario(),
+    style: {
+      fontSize: 11,
+      marginTop: 10,
+      textDecoration: "underline",
+      color: "#8A938E",
+      background: "transparent",
+      border: "none",
+      padding: 0
+    }
+  }, "Szenario zurücksetzen (Hebel bleiben erhalten)")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderRadius: 14,
+      padding: 16,
+      marginTop: 16,
       backgroundColor: "#1D2321",
       border: "1px solid #2E3634",
       boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
@@ -1915,7 +2691,7 @@ function StromtarifCockpit() {
       color: "#8A938E",
       marginBottom: 12
     }
-  }, "Objekttyp"), /*#__PURE__*/React.createElement("div", {
+  }, "1 · Objekttyp"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "grid",
       gridTemplateColumns: "1fr 1fr 1fr",
@@ -1962,285 +2738,6 @@ function StromtarifCockpit() {
       marginTop: 6
     }
   }, "Referenzverbrauch: ≈ ", fmt0(bt.kwhPerUnit * scale), " kWh/Jahr")), /*#__PURE__*/React.createElement("div", {
-    className: "stc-mono",
-    style: {
-      fontSize: 11,
-      textTransform: "uppercase",
-      color: "#8A938E",
-      margin: "16px 0 8px"
-    }
-  }, "Hebel (per Button ein-/ausschaltbar)"), /*#__PURE__*/React.createElement(LeverButton, {
-    icon: "☀️",
-    title: "Photovoltaikanlage",
-    color: "#4FA88C",
-    active: levers.pv,
-    onToggle: v => setLevers(p => ({
-      ...p,
-      pv: v
-    }))
-  }, /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Leistung pro Anlage",
-    value: levers.pvKwp,
-    onChange: v => setLevers(p => ({
-      ...p,
-      pvKwp: v
-    })),
-    min: 1,
-    max: 500,
-    step: 1,
-    unit: "kWp"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Anzahl Anlagen",
-    value: levers.pvCount,
-    onChange: v => setLevers(p => ({
-      ...p,
-      pvCount: v
-    })),
-    min: 1,
-    max: 50,
-    step: 1,
-    unit: ""
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#5A6360"
-    }
-  }, "Gesamtleistung: ", fmt1(levers.pvKwp * levers.pvCount), " kWp", levers.pvKwp * levers.pvCount >= 30 ? " (≥ 30 kWp — beachte abweichende Einspeise-/Messvorgaben in CH)" : "")), /*#__PURE__*/React.createElement(LeverButton, {
-    icon: "🔋",
-    title: "Batteriespeicher",
-    color: "#F2B84B",
-    active: levers.battery,
-    onToggle: v => setLevers(p => ({
-      ...p,
-      battery: v
-    }))
-  }, /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Kapazität pro Speicher",
-    value: levers.batteryKwh,
-    onChange: v => setLevers(p => ({
-      ...p,
-      batteryKwh: v
-    })),
-    min: 1,
-    max: 200,
-    step: 1,
-    unit: "kWh"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Lade-/Entladeleistung pro Speicher",
-    value: levers.batteryKw,
-    onChange: v => setLevers(p => ({
-      ...p,
-      batteryKw: v
-    })),
-    min: 1,
-    max: 100,
-    step: 1,
-    unit: "kW"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Anzahl Speicher",
-    value: levers.batteryCount,
-    onChange: v => setLevers(p => ({
-      ...p,
-      batteryCount: v
-    })),
-    min: 1,
-    max: 20,
-    step: 1,
-    unit: ""
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Round-Trip-Wirkungsgrad",
-    value: levers.batteryEfficiency,
-    onChange: v => setLevers(p => ({
-      ...p,
-      batteryEfficiency: v
-    })),
-    min: 70,
-    max: 98,
-    step: 1,
-    unit: "%"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Investitionskosten",
-    value: levers.batteryCostPerKwh,
-    onChange: v => setLevers(p => ({
-      ...p,
-      batteryCostPerKwh: v
-    })),
-    min: 200,
-    max: 1500,
-    step: 10,
-    unit: "CHF/kWh"
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#5A6360"
-    }
-  }, "Gesamt: ", fmt1(levers.batteryKwh * levers.batteryCount), " kWh · ", fmt1(levers.batteryKw * levers.batteryCount), " kW · Investition ≈ ", fmt0(levers.batteryKwh * levers.batteryCount * levers.batteryCostPerKwh), " CHF")), /*#__PURE__*/React.createElement(LeverButton, {
-    icon: "🔥",
-    title: "Wärmepumpe",
-    color: "#D9705A",
-    active: levers.wp,
-    onToggle: v => setLevers(p => ({
-      ...p,
-      wp: v
-    }))
-  }, /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Thermische Leistung pro Anlage",
-    value: levers.wpKwTh,
-    onChange: v => setLevers(p => ({
-      ...p,
-      wpKwTh: v
-    })),
-    min: 2,
-    max: 40,
-    step: 1,
-    unit: "kW"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Anzahl Anlagen",
-    value: levers.wpCount,
-    onChange: v => setLevers(p => ({
-      ...p,
-      wpCount: v
-    })),
-    min: 1,
-    max: 50,
-    step: 1,
-    unit: ""
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "COP (Jahresarbeitszahl)",
-    value: levers.cop,
-    onChange: v => setLevers(p => ({
-      ...p,
-      cop: v
-    })),
-    min: 2,
-    max: 5,
-    step: 0.1,
-    unit: ""
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#5A6360"
-    }
-  }, "Gesamtleistung: ", fmt1(levers.wpKwTh * levers.wpCount), " kW th")), /*#__PURE__*/React.createElement(LeverButton, {
-    icon: "🚿",
-    title: "Boiler (Warmwasser)",
-    color: "#C9A66B",
-    active: levers.boiler,
-    onToggle: v => setLevers(p => ({
-      ...p,
-      boiler: v
-    }))
-  }, /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Leistung pro Boiler",
-    value: levers.boilerKw,
-    onChange: v => setLevers(p => ({
-      ...p,
-      boilerKw: v
-    })),
-    min: 1,
-    max: 20,
-    step: 0.5,
-    unit: "kW"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Anzahl Boiler",
-    value: levers.boilerCount,
-    onChange: v => setLevers(p => ({
-      ...p,
-      boilerCount: v
-    })),
-    min: 1,
-    max: 50,
-    step: 1,
-    unit: ""
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#5A6360"
-    }
-  }, "Gesamtleistung: ", fmt1(levers.boilerKw * levers.boilerCount), " kW")), /*#__PURE__*/React.createElement(LeverButton, {
-    icon: "🧯",
-    title: "Elektroheizung",
-    color: "#A6704A",
-    active: levers.elektro,
-    onToggle: v => setLevers(p => ({
-      ...p,
-      elektro: v
-    }))
-  }, /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Leistung pro Anlage",
-    value: levers.elektroKw,
-    onChange: v => setLevers(p => ({
-      ...p,
-      elektroKw: v
-    })),
-    min: 1,
-    max: 100,
-    step: 1,
-    unit: "kW"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Anzahl Anlagen",
-    value: levers.elektroCount,
-    onChange: v => setLevers(p => ({
-      ...p,
-      elektroCount: v
-    })),
-    min: 1,
-    max: 50,
-    step: 1,
-    unit: ""
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#5A6360"
-    }
-  }, "Gesamtleistung: ", fmt1(levers.elektroKw * levers.elektroCount), " kW (direkt-elektrisch, COP = 1)")), /*#__PURE__*/React.createElement(LeverButton, {
-    icon: "⚡",
-    title: "Ladestation(en)",
-    color: "#8B6FD9",
-    active: levers.lad,
-    onToggle: v => setLevers(p => ({
-      ...p,
-      lad: v
-    }))
-  }, /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Ladeleistung pro Station",
-    value: levers.ladKw,
-    onChange: v => setLevers(p => ({
-      ...p,
-      ladKw: v
-    })),
-    min: 3.7,
-    max: 150,
-    step: 0.1,
-    unit: "kW"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Anzahl Stationen",
-    value: levers.ladCount,
-    onChange: v => setLevers(p => ({
-      ...p,
-      ladCount: v
-    })),
-    min: 1,
-    max: 100,
-    step: 1,
-    unit: ""
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Ladevorgänge / Station / Woche",
-    value: levers.ladSessionsPerWeek,
-    onChange: v => setLevers(p => ({
-      ...p,
-      ladSessionsPerWeek: v
-    })),
-    min: 1,
-    max: 14,
-    step: 1,
-    unit: ""
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#5A6360"
-    }
-  }, "Gesamtleistung: ", fmt1(levers.ladKw * levers.ladCount), " kW")), /*#__PURE__*/React.createElement("div", {
     style: {
       borderRadius: 14,
       padding: 16,
@@ -2257,7 +2754,7 @@ function StromtarifCockpit() {
       color: "#8A938E",
       marginBottom: 4
     }
-  }, "Datenquelle Grundlast"), /*#__PURE__*/React.createElement("div", {
+  }, "2 · Datenquelle Grundlast"), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 10,
       color: "#5A6360",
@@ -2434,37 +2931,728 @@ function StromtarifCockpit() {
       fontSize: 11,
       textTransform: "uppercase",
       color: "#8A938E",
+      marginBottom: 4
+    }
+  }, "3 · 🌤️ Wetterprognose (Open-Meteo)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginBottom: 10
+    }
+  }, "Kostenlose 7-Tage-Strahlungs-, Temperatur- und Bewölkungsprognose — fliesst als Bias in die vorausschauende Batteriesteuerung ein. Benötigt Internetverbindung."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      marginBottom: 8,
+      flexWrap: "wrap"
+    }
+  }, WEATHER_LOCATIONS.map(loc => /*#__PURE__*/React.createElement("button", {
+    key: loc.name,
+    onClick: () => setWeatherLoc({
+      lat: loc.lat,
+      lon: loc.lon
+    }),
+    style: {
+      fontSize: 10,
+      padding: "4px 8px",
+      borderRadius: 8,
+      border: `1px solid ${weatherLoc.lat === loc.lat ? "#4FA88C" : "#2E3634"}`,
+      color: weatherLoc.lat === loc.lat ? "#EDEDE9" : "#8A938E",
+      backgroundColor: "transparent"
+    }
+  }, loc.name))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      marginBottom: 8
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    value: weatherLoc.lat,
+    onChange: e => setWeatherLoc(p => ({
+      ...p,
+      lat: parseFloat(e.target.value)
+    })),
+    style: {
+      flex: 1,
+      fontSize: 11,
+      padding: "6px 8px",
+      borderRadius: 8,
+      background: "#14181A",
+      border: "1px solid #2E3634",
+      color: "#EDEDE9"
+    },
+    placeholder: "Breitengrad"
+  }), /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    value: weatherLoc.lon,
+    onChange: e => setWeatherLoc(p => ({
+      ...p,
+      lon: parseFloat(e.target.value)
+    })),
+    style: {
+      flex: 1,
+      fontSize: 11,
+      padding: "6px 8px",
+      borderRadius: 8,
+      background: "#14181A",
+      border: "1px solid #2E3634",
+      color: "#EDEDE9"
+    },
+    placeholder: "Längengrad"
+  })), /*#__PURE__*/React.createElement("button", {
+    onClick: loadWeatherForecast,
+    disabled: weatherLoading,
+    style: {
+      width: "100%",
+      fontSize: 12,
+      padding: "8px 0",
+      borderRadius: 8,
+      border: "1px dashed #3A423F",
+      color: "#8A938E",
+      background: "transparent"
+    }
+  }, weatherLoading ? "Lädt…" : "📡 Prognose laden"), weatherError && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#D9705A",
+      marginTop: 6
+    }
+  }, weatherError), weatherForecast && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 12
+    }
+  }, /*#__PURE__*/React.createElement(WeatherDayCards, {
+    data: weatherForecast.days
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 8,
+      marginTop: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: "1 1 45%"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "Ø Prognose 7 Tage"), /*#__PURE__*/React.createElement("div", {
+    className: "stc-display",
+    style: {
+      fontSize: 15,
+      fontWeight: 600,
+      color: "#F2B84B"
+    }
+  }, weatherForecast.avgForecast, " kWh/kWp")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: "1 1 45%"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "Saisonales Modellmittel"), /*#__PURE__*/React.createElement("div", {
+    className: "stc-display",
+    style: {
+      fontSize: 15,
+      fontWeight: 600,
+      color: "#8A938E"
+    }
+  }, weatherForecast.avgModel, " kWh/kWp"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#8A938E",
+      marginTop: 8
+    }
+  }, "Prognose-Faktor: ", /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: "#F2B84B",
+      fontWeight: 600
+    }
+  }, fmt0(weatherForecast.factor * 100), "%"), " vom saisonalen Mittel", weatherForecast.factor < 0.85 ? " — unterdurchschnittlich, Speicher hält mehr Reserve" : weatherForecast.factor > 1.15 ? " — überdurchschnittlich, Speicher verlässt sich mehr auf PV" : " — normal"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setWeatherForecast(null),
+    style: {
+      fontSize: 11,
+      marginTop: 6,
+      textDecoration: "underline",
+      color: "#8A938E",
+      background: "transparent",
+      border: "none",
+      padding: 0
+    }
+  }, "Prognose-Bias deaktivieren"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderRadius: 14,
+      padding: 16,
+      marginTop: 16,
+      backgroundColor: "#1D2321",
+      border: "1px solid #2E3634",
+      boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 11,
+      textTransform: "uppercase",
+      color: "#8A938E",
+      marginBottom: 4
+    }
+  }, "4 · 💶 Preissignal EW"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginBottom: 10
+    }
+  }, "Vom Elektrizitätswerk übermittelter Tarifplan. Nicht jedes EW arbeitet gleich — Modus wählen:"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setTariffMode("zeittarif"),
+    style: {
+      flex: 1,
+      fontSize: 11,
+      padding: "8px 4px",
+      borderRadius: 8,
+      textAlign: "center",
+      border: `1px solid ${tariffMode === "zeittarif" ? "#4FA88C" : "#2E3634"}`,
+      color: tariffMode === "zeittarif" ? "#EDEDE9" : "#8A938E",
+      backgroundColor: tariffMode === "zeittarif" ? "#1A2420" : "transparent"
+    }
+  }, "Hoch-/Niedertarif"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setTariffMode("einheitstarif"),
+    style: {
+      flex: 1,
+      fontSize: 11,
+      padding: "8px 4px",
+      borderRadius: 8,
+      textAlign: "center",
+      border: `1px solid ${tariffMode === "einheitstarif" ? "#4FA88C" : "#2E3634"}`,
+      color: tariffMode === "einheitstarif" ? "#EDEDE9" : "#8A938E",
+      backgroundColor: tariffMode === "einheitstarif" ? "#1A2420" : "transparent"
+    }
+  }, "Einheitstarif"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setTariffMode("dynamisch"),
+    style: {
+      flex: 1,
+      fontSize: 11,
+      padding: "8px 4px",
+      borderRadius: 8,
+      textAlign: "center",
+      border: `1px solid ${tariffMode === "dynamisch" ? "#4FA88C" : "#2E3634"}`,
+      color: tariffMode === "dynamisch" ? "#EDEDE9" : "#8A938E",
+      backgroundColor: tariffMode === "dynamisch" ? "#1A2420" : "transparent"
+    }
+  }, "Dynamischer Tarif")), tariffMode === "zeittarif" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginBottom: 10
+    }
+  }, tariffTiers.length, " feste Tarifstufen mit eigenen Zeitfenstern — Preise und Zeiten frei editierbar."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#8A938E",
+      marginBottom: 4
+    }
+  }, "Tagesverlauf Werktag"), /*#__PURE__*/React.createElement(TariffScheduleStrip, {
+    tiers: tariffTiers,
+    weekend: false
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#8A938E",
+      margin: "10px 0 4px"
+    }
+  }, "Tagesverlauf Wochenende"), /*#__PURE__*/React.createElement(TariffScheduleStrip, {
+    tiers: tariffTiers,
+    weekend: true
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 14,
+      display: "flex",
+      flexDirection: "column",
+      gap: 8
+    }
+  }, tariffTiers.map((tier, idx) => /*#__PURE__*/React.createElement("div", {
+    key: tier.id,
+    style: {
+      borderRadius: 10,
+      padding: 10,
+      border: `1px solid ${tier.color}66`,
+      backgroundColor: "#181D1F"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      marginBottom: 6
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      fontWeight: 600,
+      color: tier.color
+    }
+  }, "● ", tier.name), /*#__PURE__*/React.createElement("span", {
+    className: "stc-mono",
+    style: {
+      fontSize: 13,
+      color: "#EDEDE9"
+    }
+  }, tier.price, " Rp/kWh")), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Preis",
+    value: tier.price,
+    onChange: v => updateTier(idx, {
+      price: v
+    }),
+    min: 0,
+    max: 60,
+    step: 0.5,
+    unit: "Rp/kWh"
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      marginTop: 8
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: "#8A938E",
+      marginBottom: 2
+    }
+  }, "Von"), /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    min: 0,
+    max: 23,
+    value: tier.startHour,
+    onChange: e => updateTier(idx, {
+      startHour: parseInt(e.target.value) || 0
+    }),
+    style: {
+      width: "100%",
+      fontSize: 11,
+      padding: "5px 6px",
+      borderRadius: 6,
+      background: "#14181A",
+      border: "1px solid #2E3634",
+      color: "#EDEDE9"
+    }
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: "#8A938E",
+      marginBottom: 2
+    }
+  }, "Bis"), /*#__PURE__*/React.createElement("input", {
+    type: "number",
+    min: 0,
+    max: 24,
+    value: tier.endHour,
+    onChange: e => updateTier(idx, {
+      endHour: parseInt(e.target.value) || 0
+    }),
+    style: {
+      width: "100%",
+      fontSize: 11,
+      padding: "5px 6px",
+      borderRadius: 6,
+      background: "#14181A",
+      border: "1px solid #2E3634",
+      color: "#EDEDE9"
+    }
+  })), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1.5
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: "#8A938E",
+      marginBottom: 2
+    }
+  }, "Gültig"), /*#__PURE__*/React.createElement("select", {
+    value: tier.scope,
+    onChange: e => updateTier(idx, {
+      scope: e.target.value
+    }),
+    style: {
+      width: "100%",
+      fontSize: 11,
+      padding: "5px 6px",
+      borderRadius: 6,
+      background: "#14181A",
+      border: "1px solid #2E3634",
+      color: "#EDEDE9"
+    }
+  }, /*#__PURE__*/React.createElement("option", {
+    value: "all"
+  }, "Alle Tage"), /*#__PURE__*/React.createElement("option", {
+    value: "weekday"
+  }, "Werktags"), /*#__PURE__*/React.createElement("option", {
+    value: "weekend"
+  }, "Wochenende")))))))), tariffMode === "einheitstarif" && /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderRadius: 10,
+      padding: 12,
+      border: "1px solid #2E3634",
+      backgroundColor: "#181D1F"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#8A938E",
+      marginBottom: 8
+    }
+  }, "Einheitstarif: ein einziger Preis, unabhängig von Uhrzeit oder Wochentag."), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Preis",
+    value: flatPrice,
+    onChange: setFlatPrice,
+    min: 0,
+    max: 60,
+    step: 0.5,
+    unit: "Rp/kWh"
+  })), tariffMode === "dynamisch" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginBottom: 10
+    }
+  }, "Beliebig viele Tarifstufen, jede mit eigenem Preis und per Regler frei wählbarem Zeitfenster."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
       marginBottom: 12
     }
-  }, "Tarifparameter"), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: "#8A938E"
+    }
+  }, "Anzahl Tarife"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      const n = Math.max(2, dynamicCount - 1);
+      setDynamicCount(n);
+      setDynamicTiers(generateDynamicTiers(n));
+    },
+    style: {
+      width: 26,
+      height: 26,
+      borderRadius: 8,
+      border: "1px solid #2E3634",
+      color: "#EDEDE9",
+      background: "transparent"
+    }
+  }, "−"), /*#__PURE__*/React.createElement("span", {
+    className: "stc-display",
+    style: {
+      fontSize: 15,
+      fontWeight: 600,
+      minWidth: 16,
+      textAlign: "center"
+    }
+  }, dynamicCount), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      const n = Math.min(8, dynamicCount + 1);
+      setDynamicCount(n);
+      setDynamicTiers(generateDynamicTiers(n));
+    },
+    style: {
+      width: 26,
+      height: 26,
+      borderRadius: 8,
+      border: "1px solid #2E3634",
+      color: "#EDEDE9",
+      background: "transparent"
+    }
+  }, "+"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#8A938E",
+      marginBottom: 4
+    }
+  }, "Tagesverlauf"), /*#__PURE__*/React.createElement(TariffScheduleStrip, {
+    tiers: dynamicTiers,
+    weekend: false
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 14,
+      display: "flex",
+      flexDirection: "column",
+      gap: 8
+    }
+  }, dynamicTiers.map((tier, idx) => /*#__PURE__*/React.createElement("div", {
+    key: tier.id,
+    style: {
+      borderRadius: 10,
+      padding: 10,
+      border: `1px solid ${tier.color}66`,
+      backgroundColor: "#181D1F"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      marginBottom: 6
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12,
+      fontWeight: 600,
+      color: tier.color
+    }
+  }, "● ", tier.name), /*#__PURE__*/React.createElement("span", {
+    className: "stc-mono",
+    style: {
+      fontSize: 13,
+      color: "#EDEDE9"
+    }
+  }, tier.price, " Rp/kWh")), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Preis",
+    value: tier.price,
+    onChange: v => setDynamicTiers(p => p.map((t, i) => i === idx ? {
+      ...t,
+      price: v
+    } : t)),
+    min: 0,
+    max: 60,
+    step: 0.5,
+    unit: "Rp/kWh"
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Startstunde",
+    value: tier.startHour,
+    onChange: v => setDynamicTiers(p => p.map((t, i) => i === idx ? {
+      ...t,
+      startHour: v
+    } : t)),
+    min: 0,
+    max: 24,
+    step: 1,
+    unit: "Uhr"
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Endstunde",
+    value: tier.endHour,
+    onChange: v => setDynamicTiers(p => p.map((t, i) => i === idx ? {
+      ...t,
+      endHour: v
+    } : t)),
+    min: 0,
+    max: 24,
+    step: 1,
+    unit: "Uhr"
+  }))))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 14,
+      paddingTop: 12,
+      borderTop: "1px solid #2E3634"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#8A938E",
+      marginBottom: 4
+    }
+  }, "Zusätzliches Netzstatus-Signal (Demand Response)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: "#5A6360",
+      marginBottom: 8
+    }
+  }, "Simulierter Trigger — hier würde in der Praxis ein reales Signal des EW andocken (z.B. via API/EEBus) und die Batterie-Netzladung sperren/drosseln."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6
+    }
+  }, [{
+    key: "gruen",
+    label: "🟢 Grün",
+    desc: "Normal"
+  }, {
+    key: "gelb",
+    label: "🟡 Gelb",
+    desc: "Angespannt"
+  }, {
+    key: "rot",
+    label: "🔴 Rot",
+    desc: "Kritisch"
+  }].map(opt => /*#__PURE__*/React.createElement("button", {
+    key: opt.key,
+    onClick: () => setLevers(p => ({
+      ...p,
+      ewSignal: opt.key
+    })),
+    style: {
+      flex: 1,
+      fontSize: 11,
+      padding: "8px 2px",
+      borderRadius: 8,
+      textAlign: "center",
+      border: `1px solid ${levers.ewSignal === opt.key ? "#4FA88C" : "#2E3634"}`,
+      color: levers.ewSignal === opt.key ? "#EDEDE9" : "#8A938E",
+      backgroundColor: levers.ewSignal === opt.key ? "#1A2420" : "transparent"
+    }
+  }, /*#__PURE__*/React.createElement("div", null, opt.label), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: "#5A6360"
+    }
+  }, opt.desc)))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginTop: 8
+    }
+  }, levers.ewSignal === "rot" && "Rot: Netzladung der Batterie komplett gesperrt (Netzentlastung hat Vorrang).", levers.ewSignal === "gelb" && "Gelb: Netzladung auf 50% Leistung gedrosselt.", levers.ewSignal === "gruen" && "Grün: volle Vorausschau-/Arbitragefunktion erlaubt.")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 14,
+      paddingTop: 12,
+      borderTop: "1px solid #2E3634"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#8A938E",
+      marginBottom: 4
+    }
+  }, "🔌 Systemdienstleistungen (Swissgrid via EW)"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: "#5A6360",
+      marginBottom: 8
+    }
+  }, "Simuliertes Signal — zeigt, was der Kunde für Laden/Entladen der Batterie in diesem Moment für Netz-Systemdienstleistungen (z.B. Primärregelleistung, die Swissgrid ausschreibt und das EW als Aggregator vermarktet) vergütet bekäme."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      marginBottom: 8
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 11,
+      color: "#8A938E"
+    }
+  }, "Batterie dafür freigeben"), /*#__PURE__*/React.createElement(Toggle, {
+    checked: levers.sdlEnabled,
+    onChange: v => setLevers(p => ({
+      ...p,
+      sdlEnabled: v
+    })),
+    color: "#4FA88C"
+  })), levers.sdlEnabled && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      marginBottom: 10
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      borderRadius: 8,
+      padding: 8,
+      backgroundColor: "#181D1F",
+      textAlign: "center"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "Vergütung jetzt: Laden"), /*#__PURE__*/React.createElement("div", {
+    className: "stc-display",
+    style: {
+      fontSize: 15,
+      fontWeight: 600,
+      color: "#4FA88C"
+    }
+  }, sdlNow.charge, " Rp/kWh")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      flex: 1,
+      borderRadius: 8,
+      padding: 8,
+      backgroundColor: "#181D1F",
+      textAlign: "center"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 9,
+      color: "#8A938E"
+    }
+  }, "Vergütung jetzt: Entladen"), /*#__PURE__*/React.createElement("div", {
+    className: "stc-display",
+    style: {
+      fontSize: 15,
+      fontWeight: 600,
+      color: "#F2B84B"
+    }
+  }, sdlNow.discharge, " Rp/kWh"))), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Erwarteter Jahreserlös",
+    value: levers.sdlPricePerKw,
+    onChange: v => setLevers(p => ({
+      ...p,
+      sdlPricePerKw: v
+    })),
+    min: 0,
+    max: 300,
+    step: 5,
+    unit: "CHF/kW·Jahr"
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginTop: 4
+    }
+  }, "Fliesst als zusätzlicher Ertrag in die Amortisationsrechnung der Batterie ein.")))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      borderRadius: 14,
+      padding: 16,
+      marginTop: 16,
+      backgroundColor: "#1D2321",
+      border: "1px solid #2E3634",
+      boxShadow: "0 2px 16px rgba(0,0,0,0.25)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 11,
+      textTransform: "uppercase",
+      color: "#8A938E",
+      marginBottom: 12
+    }
+  }, "5 · Tarifparameter"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
       gap: 10
     }
   }, /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Hochtarif (HT)",
-    value: tariff.htPrice,
-    onChange: v => setTariff(p => ({
-      ...p,
-      htPrice: v
-    })),
-    min: 5,
-    max: 45,
-    step: 0.5,
-    unit: "Rp/kWh"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
-    label: "Niedertarif (NT)",
-    value: tariff.ntPrice,
-    onChange: v => setTariff(p => ({
-      ...p,
-      ntPrice: v
-    })),
-    min: 5,
-    max: 35,
-    step: 0.5,
-    unit: "Rp/kWh"
-  }), /*#__PURE__*/React.createElement(SliderRow, {
     label: "Netzentgelt",
     value: tariff.netzentgelt,
     onChange: v => setTariff(p => ({
@@ -2520,7 +3708,337 @@ function StromtarifCockpit() {
     max: 200,
     step: 5,
     unit: "CHF/kW·a"
-  })))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "stc-mono",
+    style: {
+      fontSize: 11,
+      textTransform: "uppercase",
+      color: "#8A938E",
+      margin: "16px 0 8px"
+    }
+  }, "6 · Hebel (per Button ein-/ausschaltbar)"), /*#__PURE__*/React.createElement(LeverButton, {
+    icon: "☀️",
+    title: "Photovoltaikanlage",
+    color: "#4FA88C",
+    active: levers.pv,
+    onToggle: v => setLevers(p => ({
+      ...p,
+      pv: v
+    }))
+  }, /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Leistung pro Anlage",
+    value: levers.pvKwp,
+    onChange: v => setLevers(p => ({
+      ...p,
+      pvKwp: v
+    })),
+    min: 1,
+    max: 500,
+    step: 1,
+    unit: "kWp"
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Anzahl Anlagen",
+    value: levers.pvCount,
+    onChange: v => setLevers(p => ({
+      ...p,
+      pvCount: v
+    })),
+    min: 1,
+    max: 50,
+    step: 1,
+    unit: ""
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#5A6360"
+    }
+  }, "Gesamtleistung: ", fmt1(levers.pvKwp * levers.pvCount), " kWp", levers.pvKwp * levers.pvCount >= 30 ? " (≥ 30 kWp — beachte abweichende Einspeise-/Messvorgaben in CH)" : "")), /*#__PURE__*/React.createElement(LeverButton, {
+    icon: "🔋",
+    title: "Batteriespeicher",
+    color: "#F2B84B",
+    active: levers.battery,
+    onToggle: v => setLevers(p => ({
+      ...p,
+      battery: v
+    }))
+  }, /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Kapazität pro Speicher",
+    value: levers.batteryKwh,
+    onChange: v => setLevers(p => ({
+      ...p,
+      batteryKwh: v
+    })),
+    min: 1,
+    max: 200,
+    step: 1,
+    unit: "kWh"
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Lade-/Entladeleistung pro Speicher",
+    value: levers.batteryKw,
+    onChange: v => setLevers(p => ({
+      ...p,
+      batteryKw: v
+    })),
+    min: 1,
+    max: 100,
+    step: 1,
+    unit: "kW"
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Anzahl Speicher",
+    value: levers.batteryCount,
+    onChange: v => setLevers(p => ({
+      ...p,
+      batteryCount: v
+    })),
+    min: 1,
+    max: 20,
+    step: 1,
+    unit: ""
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Round-Trip-Wirkungsgrad",
+    value: levers.batteryEfficiency,
+    onChange: v => setLevers(p => ({
+      ...p,
+      batteryEfficiency: v
+    })),
+    min: 70,
+    max: 98,
+    step: 1,
+    unit: "%"
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Investitionskosten",
+    value: levers.batteryCostPerKwh,
+    onChange: v => setLevers(p => ({
+      ...p,
+      batteryCostPerKwh: v
+    })),
+    min: 200,
+    max: 1500,
+    step: 10,
+    unit: "CHF/kWh"
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#5A6360"
+    }
+  }, "Gesamt: ", fmt1(levers.batteryKwh * levers.batteryCount), " kWh · ", fmt1(levers.batteryKw * levers.batteryCount), " kW · Investition ≈ ", fmt0(levers.batteryKwh * levers.batteryCount * levers.batteryCostPerKwh), " CHF"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 10,
+      paddingTop: 10,
+      borderTop: "1px solid #2E3634"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#8A938E",
+      marginBottom: 4
+    }
+  }, "🧠 Steuerungsstrategie"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setLevers(p => ({
+      ...p,
+      batteryStrategy: "reactive"
+    })),
+    style: {
+      flex: 1,
+      fontSize: 11,
+      padding: "6px 0",
+      borderRadius: 8,
+      border: `1px solid ${levers.batteryStrategy === "reactive" ? "#F2B84B" : "#2E3634"}`,
+      color: levers.batteryStrategy === "reactive" ? "#EDEDE9" : "#8A938E",
+      backgroundColor: levers.batteryStrategy === "reactive" ? "#2A2419" : "transparent"
+    }
+  }, "Reaktiv"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setLevers(p => ({
+      ...p,
+      batteryStrategy: "predictive"
+    })),
+    style: {
+      flex: 1,
+      fontSize: 11,
+      padding: "6px 0",
+      borderRadius: 8,
+      border: `1px solid ${levers.batteryStrategy === "predictive" ? "#F2B84B" : "#2E3634"}`,
+      color: levers.batteryStrategy === "predictive" ? "#EDEDE9" : "#8A938E",
+      backgroundColor: levers.batteryStrategy === "predictive" ? "#2A2419" : "transparent"
+    }
+  }, "Vorausschauend")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      color: "#5A6360",
+      marginTop: 4
+    }
+  }, levers.batteryStrategy === "predictive" ? "Lädt bei Bedarf gezielt aus einer günstigeren Tarifstufe vor, wenn bald eine teurere beginnt UND die eigene PV-Prognose den Tagesbedarf voraussichtlich nicht deckt. Berücksichtigt alle Tarifstufen, Wetterprognose-Bias und Netzstatus-Signal." : "Lädt nur aus PV-Überschuss, entlädt bei Bedarf — maximiert Eigenverbrauch, ohne Tarif-Voraussicht."))), /*#__PURE__*/React.createElement(LeverButton, {
+    icon: "🔥",
+    title: "Wärmepumpe",
+    color: "#D9705A",
+    active: levers.wp,
+    onToggle: v => setLevers(p => ({
+      ...p,
+      wp: v
+    }))
+  }, /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Thermische Leistung pro Anlage",
+    value: levers.wpKwTh,
+    onChange: v => setLevers(p => ({
+      ...p,
+      wpKwTh: v
+    })),
+    min: 2,
+    max: 40,
+    step: 1,
+    unit: "kW"
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Anzahl Anlagen",
+    value: levers.wpCount,
+    onChange: v => setLevers(p => ({
+      ...p,
+      wpCount: v
+    })),
+    min: 1,
+    max: 50,
+    step: 1,
+    unit: ""
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "COP (Jahresarbeitszahl)",
+    value: levers.cop,
+    onChange: v => setLevers(p => ({
+      ...p,
+      cop: v
+    })),
+    min: 2,
+    max: 5,
+    step: 0.1,
+    unit: ""
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#5A6360"
+    }
+  }, "Gesamtleistung: ", fmt1(levers.wpKwTh * levers.wpCount), " kW th")), /*#__PURE__*/React.createElement(LeverButton, {
+    icon: "🚿",
+    title: "Boiler (Warmwasser)",
+    color: "#C9A66B",
+    active: levers.boiler,
+    onToggle: v => setLevers(p => ({
+      ...p,
+      boiler: v
+    }))
+  }, /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Leistung pro Boiler",
+    value: levers.boilerKw,
+    onChange: v => setLevers(p => ({
+      ...p,
+      boilerKw: v
+    })),
+    min: 1,
+    max: 20,
+    step: 0.5,
+    unit: "kW"
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Anzahl Boiler",
+    value: levers.boilerCount,
+    onChange: v => setLevers(p => ({
+      ...p,
+      boilerCount: v
+    })),
+    min: 1,
+    max: 50,
+    step: 1,
+    unit: ""
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#5A6360"
+    }
+  }, "Gesamtleistung: ", fmt1(levers.boilerKw * levers.boilerCount), " kW")), /*#__PURE__*/React.createElement(LeverButton, {
+    icon: "🧯",
+    title: "Elektroheizung",
+    color: "#A6704A",
+    active: levers.elektro,
+    onToggle: v => setLevers(p => ({
+      ...p,
+      elektro: v
+    }))
+  }, /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Leistung pro Anlage",
+    value: levers.elektroKw,
+    onChange: v => setLevers(p => ({
+      ...p,
+      elektroKw: v
+    })),
+    min: 1,
+    max: 100,
+    step: 1,
+    unit: "kW"
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Anzahl Anlagen",
+    value: levers.elektroCount,
+    onChange: v => setLevers(p => ({
+      ...p,
+      elektroCount: v
+    })),
+    min: 1,
+    max: 50,
+    step: 1,
+    unit: ""
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#5A6360"
+    }
+  }, "Gesamtleistung: ", fmt1(levers.elektroKw * levers.elektroCount), " kW (direkt-elektrisch, COP = 1)")), /*#__PURE__*/React.createElement(LeverButton, {
+    icon: "⚡",
+    title: "Ladestation(en)",
+    color: "#8B6FD9",
+    active: levers.lad,
+    onToggle: v => setLevers(p => ({
+      ...p,
+      lad: v
+    }))
+  }, /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Ladeleistung pro Station",
+    value: levers.ladKw,
+    onChange: v => setLevers(p => ({
+      ...p,
+      ladKw: v
+    })),
+    min: 3.7,
+    max: 150,
+    step: 0.1,
+    unit: "kW"
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Anzahl Stationen",
+    value: levers.ladCount,
+    onChange: v => setLevers(p => ({
+      ...p,
+      ladCount: v
+    })),
+    min: 1,
+    max: 100,
+    step: 1,
+    unit: ""
+  }), /*#__PURE__*/React.createElement(SliderRow, {
+    label: "Ladevorgänge / Station / Woche",
+    value: levers.ladSessionsPerWeek,
+    onChange: v => setLevers(p => ({
+      ...p,
+      ladSessionsPerWeek: v
+    })),
+    min: 1,
+    max: 14,
+    step: 1,
+    unit: ""
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 11,
+      color: "#5A6360"
+    }
+  }, "Gesamtleistung: ", fmt1(levers.ladKw * levers.ladCount), " kW"))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexWrap: "wrap",
@@ -2596,6 +4114,11 @@ function StromtarifCockpit() {
     unit: "",
     color: "#F2B84B"
   }), /*#__PURE__*/React.createElement(KPI, {
+    label: "Netzladung (Vorausschau)",
+    value: fmt0(sim.sumBatteryGridCharge),
+    unit: "kWh",
+    color: "#F2B84B"
+  }), /*#__PURE__*/React.createElement(KPI, {
     label: "Peak-Reduktion",
     value: fmt1(Math.max(0, sim.peakGridNoBatt - sim.peakGrid)),
     unit: "kW",
@@ -2608,6 +4131,11 @@ function StromtarifCockpit() {
   }), /*#__PURE__*/React.createElement(KPI, {
     label: "Jährliche Einsparung",
     value: fmt0(batteryAnalysis.jaehrlicheEinsparung),
+    unit: "CHF",
+    color: "#4FA88C"
+  }), levers.sdlEnabled && /*#__PURE__*/React.createElement(KPI, {
+    label: "davon Systemdienstleistungen",
+    value: fmt0(batteryAnalysis.sdlRevenue),
     unit: "CHF",
     color: "#4FA88C"
   }), /*#__PURE__*/React.createElement(KPI, {
@@ -2751,8 +4279,11 @@ function StromtarifCockpit() {
       color: "#8A938E",
       marginBottom: 4
     }
-  }, "🔋 Batterie-Ladezustand (Tagesverlauf)"), /*#__PURE__*/React.createElement(SoCSparkline, {
-    data: dayData
+  }, "🔋 Batterie-Ladezustand (Tagesverlauf)"), /*#__PURE__*/React.createElement(MiniSparkline, {
+    data: dayData,
+    field: "BatterieSoC",
+    color: "#F2B84B",
+    fixedMax: 100
   }))), /*#__PURE__*/React.createElement("div", {
     style: {
       borderRadius: 14,
