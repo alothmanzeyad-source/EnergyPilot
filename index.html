@@ -3,14 +3,14 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
-<title>WattFox — Stromtarif-Cockpit</title>
+<title>Energy Pilot — Stromtarif-Cockpit</title>
 <meta name="theme-color" content="#14181A" />
 <link rel="manifest" href="./manifest.json" />
 <link rel="icon" href="./icon-192.png" />
 <link rel="apple-touch-icon" href="./icon-192.png" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-<meta name="apple-mobile-web-app-title" content="WattFox" />
+<meta name="apple-mobile-web-app-title" content="Energy Pilot" />
 <style>
   @import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap");
   * { box-sizing: border-box; }
@@ -381,12 +381,15 @@ break;case"<bookViews":;case"<bookViews>":;case"</bookViews>":break;case"<workbo
 </script>
 <script>
 // ===========================================================================
-// WattFox — Stromtarif-Simulationsmodell & Dashboard
+// Energy Pilot — Stromtarif-Simulationsmodell & Dashboard
 // Reines Client-seitiges React (kein Build-Step nötig, JSX wird im Browser
 // per @babel/standalone transpiliert). Mountet automatisch in jedes Element
 // mit der Klasse "stromtarif-cockpit-root" (siehe stromtarif-cockpit.php).
 // ===========================================================================
 
+// Basis-URL für Bild-Assets (Logo etc.): im WordPress-Plugin von PHP gesetzt
+// (window.ENERGY_PILOT_ASSETS_URL), in der PWA einfach der eigene Ordner.
+const ASSET_BASE = typeof window !== "undefined" && window.ENERGY_PILOT_ASSETS_URL ? window.ENERGY_PILOT_ASSETS_URL : "./";
 const {
   useState,
   useMemo,
@@ -2526,7 +2529,25 @@ function StromtarifCockpit() {
       marginBottom: 6,
       fontWeight: 500
     }
-  }, "⚡ Stromtarif-Simulations-Cockpit"), /*#__PURE__*/React.createElement("h1", {
+  }, "⚡ Stromtarif-Simulations-Cockpit"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 10
+    }
+  }, /*#__PURE__*/React.createElement("img", {
+    src: `${ASSET_BASE}logo-mark.png`,
+    alt: "Energy Pilot Logo",
+    style: {
+      height: 44,
+      width: 44,
+      objectFit: "contain",
+      flexShrink: 0
+    },
+    onError: e => {
+      e.target.style.display = "none";
+    }
+  }), /*#__PURE__*/React.createElement("h1", {
     className: "stc-display",
     style: {
       fontSize: 34,
@@ -2538,7 +2559,7 @@ function StromtarifCockpit() {
       backgroundClip: "text",
       color: "transparent"
     }
-  }, "🦊 WattFox"), /*#__PURE__*/React.createElement("p", {
+  }, "Energy Pilot")), /*#__PURE__*/React.createElement("p", {
     style: {
       fontSize: 14,
       color: "var(--stc-muted)",

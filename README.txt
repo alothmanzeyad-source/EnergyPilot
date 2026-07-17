@@ -1,4 +1,4 @@
-WATTFOX — Stromtarif-Cockpit (Robuste Standalone-Version)
+ENERGY PILOT — Stromtarif-Cockpit (Robuste Standalone-Version)
 ===================================================
 
 WAS IST ANDERS ALS VORHER?

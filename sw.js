@@ -1,5 +1,5 @@
-const CACHE_NAME = "wattfox-cockpit-v5";
-const APP_SHELL = ["./", "./index.html", "./manifest.json", "./icon-192.png", "./icon-512.png", "./icon-512-maskable.png"];
+const CACHE_NAME = "energypilot-cockpit-v8";
+const APP_SHELL = ["./", "./index.html", "./manifest.json", "./icon-192.png", "./icon-512.png", "./icon-512-maskable.png", "./logo-mark.png", "./logo-banner.png"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(

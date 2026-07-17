@@ -1,7 +1,7 @@
 {
-  "name": "WattFox — Stromtarif-Cockpit",
-  "short_name": "WattFox",
-  "description": "WattFox: Simulationstool für Stromtarife: 15-Minuten-Lastgänge, Hebel (PV, Wärmepumpe, Boiler, Elektroheizung, Ladestation), skalierbar nach Objekttyp inkl. Grosskunde, mit Lastspitzen-Heatmap.",
+  "name": "Energy Pilot — Stromtarif-Cockpit",
+  "short_name": "Energy Pilot",
+  "description": "Energy Pilot: Simulationstool für Stromtarife: 15-Minuten-Lastgänge, Hebel (PV, Wärmepumpe, Boiler, Elektroheizung, Ladestation), skalierbar nach Objekttyp inkl. Grosskunde, mit Lastspitzen-Heatmap.",
   "start_url": "./index.html",
   "scope": "./",
   "display": "standalone",
